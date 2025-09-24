@@ -1,3 +1,19 @@
+/* usage examples:
+# Uniform in [-100, 100]
+./gen_points 1000 uniform -100 100
+
+# Gaussian with mean=0, stddev=50 will mostly be in [-3*stddev, 3*stddev]
+./gen_points 1000 gaussian 0 50
+
+# Inside circle of radius 200
+./gen_points 1000 circle 200
+
+# Only boundary of circle radius 200
+./gen_points 1000 circle 200 boundary
+
+*/
+
+
 #include <iostream>
 #include <fstream>
 #include <random>
@@ -7,7 +23,6 @@
 
 using namespace std;
 
-// Typedef for coordinate type (easy to switch)
 typedef float DataType;   // change to double or int if needed
 
 #ifndef M_PI
@@ -21,15 +36,18 @@ struct Point {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        cerr << "Usage: " << argv[0] << " <N_points> <distribution>\n";
-        cerr << "Distributions: uniform, gaussian, circle\n";
+        cerr << "Usage: " << argv[0] << " <N_points> <distribution> [params...]\n";
+        cerr << "Distributions:\n";
+        cerr << "  uniform <min> <max>\n";
+        cerr << "  gaussian <mean> <stddev>\n";
+        cerr << "  circle <radius> [boundary]\n";
         return 1;
     }
 
     size_t N = stoull(argv[1]);
     string dist_type = argv[2];
 
-    // Construct filename automatically
+    // Construct filename 
     string filename = "points_" + dist_type + "_" + to_string(N) + ".txt";
 
     ofstream out(filename);
@@ -42,11 +60,51 @@ int main(int argc, char* argv[]) {
     unsigned seed = chrono::high_resolution_clock::now().time_since_epoch().count();
     mt19937 rng(seed);
 
-    // Distributions
-    uniform_real_distribution<DataType> dist_uniform(-1000.0, 1000.0);
-    normal_distribution<DataType> dist_gauss(0.0, 300.0); // mean=0, stddev=300
+    // Declare distributions
+    uniform_real_distribution<DataType> dist_uniform(0.0, 1.0); // dummy init
+    normal_distribution<DataType> dist_gauss(0.0, 1.0);
     uniform_real_distribution<DataType> dist_angle(0.0, static_cast<DataType>(2.0 * M_PI));
-    uniform_real_distribution<DataType> dist_radius(0.0, 1000.0);
+    uniform_real_distribution<DataType> dist_radius(0.0, 1.0);
+
+    // Circle config
+    bool circle_boundary_only = false;
+    DataType circle_radius = 1.0;
+
+    // Configure distributions based on type
+    if (dist_type == "uniform") {
+        if (argc < 5) {
+            cerr << "Usage: " << argv[0] << " N uniform <min> <max>\n";
+            return 1;
+        }
+        DataType min_val = stof(argv[3]);
+        DataType max_val = stof(argv[4]);
+        dist_uniform = uniform_real_distribution<DataType>(min_val, max_val);
+    } 
+    else if (dist_type == "gaussian") {
+        if (argc < 5) {
+            cerr << "Usage: " << argv[0] << " N gaussian <mean> <stddev>\n";
+            return 1;
+        }
+        DataType mean = stof(argv[3]);
+        DataType stddev = stof(argv[4]);
+        dist_gauss = normal_distribution<DataType>(mean, stddev);
+    } 
+    else if (dist_type == "circle") {
+        if (argc < 4) {
+            cerr << "Usage: " << argv[0] << " N circle <radius> [boundary]\n";
+            return 1;
+        }
+        circle_radius = stof(argv[3]);
+        dist_radius = uniform_real_distribution<DataType>(0.0, circle_radius);
+
+        if (argc >= 5 && string(argv[4]) == "boundary") {
+            circle_boundary_only = true;
+        }
+    } 
+    else {
+        cerr << "Unknown distribution type: " << dist_type << "\n";
+        return 1;
+    }
 
     size_t progress_step = N / 100;  // 1% step
     if (progress_step == 0) progress_step = 1;
@@ -56,17 +114,16 @@ int main(int argc, char* argv[]) {
         if (dist_type == "uniform") {
             x = dist_uniform(rng);
             y = dist_uniform(rng);
-        } else if (dist_type == "gaussian") {
+        } 
+        else if (dist_type == "gaussian") {
             x = dist_gauss(rng);
             y = dist_gauss(rng);
-        } else if (dist_type == "circle") {
+        } 
+        else if (dist_type == "circle") {
             DataType angle = dist_angle(rng);
-            DataType r = dist_radius(rng);
+            DataType r = circle_boundary_only ? circle_radius : dist_radius(rng);
             x = r * cos(angle);
             y = r * sin(angle);
-        } else {
-            cerr << "Unknown distribution type: " << dist_type << "\n";
-            return 1;
         }
 
         out << x << " " << y << "\n";
@@ -82,7 +139,9 @@ int main(int argc, char* argv[]) {
 
     out.close();
     cout << "Generated " << N << " " << dist_type 
-         << " points into file " << filename << "\n";
+         << " points into file " << filename 
+         << (circle_boundary_only ? " (boundary only)" : "") 
+         << "\n";
 
     return 0;
 }
