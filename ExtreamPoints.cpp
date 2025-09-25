@@ -96,6 +96,7 @@ __global__ void global_min_max_reduce(
     DataType* min_proj_half,
     DataType* max_proj_half
 ) {
+    
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= K2) return;
 
@@ -118,34 +119,56 @@ __global__ void recover_indices(
     const DataType* __restrict__ max_proj_half,
     int N,
     int K2,
+    int blocks_per_dir,
     int* min_idx_half,
     int* max_idx_half
 ) {
-    int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= K2) return;
+    // int d = blockIdx.x * blockDim.x + threadIdx.x;
+    // if (d >= K2) return;
+
+    int globalBlock = blockIdx.x;
+    int dir = globalBlock / blocks_per_dir;
+    if (dir >= K2) return;
+    int tid = threadIdx.x;
+    int dBlock= globalBlock % blocks_per_dir;
+    int start = tid + dBlock * blockDim.x;
+    int stride = blockDim.x * blocks_per_dir;
+
 
     // DataType dx = dir_x[d];
     // DataType dy = dir_y[d];
     //calculate direction on the fly to save memory bandwidth
-    double angle = (2.0 * M_PI * d) / (K2*2);
+    double angle = (2.0 * M_PI * dir) / (K2*2);
     DataType dx = cos(angle);
     DataType dy = sin(angle);
 
-    DataType target_min = min_proj_half[d];
-    DataType target_max = max_proj_half[d];
+    DataType target_min = min_proj_half[dir];
+    DataType target_max = max_proj_half[dir];
 
-    int found_min = -1;
-    int found_max = -1;
-
-    for (int i = 0; i < N; i++) {
+    for (int i = start; i < N; i += stride) {
         DataType proj = x[i] * dx + y[i] * dy;
-        if (found_min == -1 && fabs(proj - target_min) < 1e-6f) found_min = i;
-        if (found_max == -1 && fabs(proj - target_max) < 1e-6f) found_max = i;
-        if (found_min != -1 && found_max != -1) break;
+        if (fabs(proj - target_min) < 1e-6f) {
+            min_idx_half[dir] = i;
+            // as int is primitive type and any index will satisfy target_min will work
+            // so we can directly assign without atomic operation
+        }
+        if (fabs(proj - target_max) < 1e-6f) {
+            max_idx_half[dir] = i;
+        }
     }
 
-    min_idx_half[d] = found_min;
-    max_idx_half[d] = found_max;
+    // int found_min = -1;
+    // int found_max = -1;
+
+    // for (int i = 0; i < N; i++) {
+    //     DataType proj = x[i] * dx + y[i] * dy;
+    //     if (found_min == -1 && fabs(proj - target_min) < 1e-6f) found_min = i;
+    //     if (found_max == -1 && fabs(proj - target_max) < 1e-6f) found_max = i;
+    //     if (found_min != -1 && found_max != -1) break;
+    // }
+
+    // min_idx_half[d] = found_min;
+    // max_idx_half[d] = found_max;
 }
 
 // ======================= Kernel 3: Reconstruct Full K =======================
@@ -291,8 +314,8 @@ int main(int argc, char* argv[]) {
                        d_block_min_proj, d_block_max_proj, K2, blocks_per_dir,
                        d_min_proj_half, d_max_proj_half);
 
-    hipLaunchKernelGGL(recover_indices, dim3(blocks2), dim3(threads2), 0, 0,
-                       d_x, d_y, d_min_proj_half, d_max_proj_half, N, K2,
+    hipLaunchKernelGGL(recover_indices, dim3(numBlocks), dim3(TILE_SIZE), 0, 0,
+                       d_x, d_y, d_min_proj_half, d_max_proj_half, N, K2, blocks_per_dir,
                        d_min_idx_half, d_max_idx_half);
 
     hipLaunchKernelGGL(reconstruct_full_K, dim3(blocks2), dim3(threads2), 0, 0,
