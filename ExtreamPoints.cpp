@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <cfloat>
+#include <chrono>
 
 typedef float DataType;
 using namespace std;
@@ -161,6 +162,54 @@ __global__ void reconstruct_full_K(
     full_idx[j]  = min_idx_half[d];
 }
 
+
+// ======================= Kernel 4: check Point inside Polygon =======================
+__global__ void point_in_polygon_kernel(
+    const DataType* __restrict__ x,
+    const DataType* __restrict__ y,
+    int N,
+    const DataType* __restrict__ poly_x,
+    const DataType* __restrict__ poly_y,
+    int K,
+    int blocks_per_edge,
+    char* inside
+) {
+    int globalBlock = blockIdx.x;
+    int edge = globalBlock / blocks_per_edge;   // which edge this block belongs to
+    if (edge >= K) return;
+    int eBlock = globalBlock % blocks_per_edge; // which block within edge
+
+    int tid = threadIdx.x;
+    int start = eBlock * blockDim.x + tid;
+    int stride = blockDim.x * blocks_per_edge;
+
+    // Edge endpoints
+    DataType Ax = poly_x[edge];
+    DataType Ay = poly_y[edge];
+    DataType Bx = poly_x[(edge + 1) % K];
+    DataType By = poly_y[(edge + 1) % K];
+
+    // Edge direction
+    DataType ex = Bx - Ax;
+    DataType ey = By - Ay;
+
+    for (int idx = start; idx < N; idx += stride) {
+        if (inside[idx]==0) continue; // already marked false by some other edge
+
+        // Vector from edge start to point
+        DataType px = x[idx] - Ax;
+        DataType py = y[idx] - Ay;
+
+        // Cross product (CCW polygon: inside if cross >= 0)
+        DataType cross = ex * py - ey * px;
+
+        if (cross < (1e-6f)) { // allow small tolerance
+            inside[idx] = 0; // mark outside
+        }
+    }
+}
+
+
 // ======================= MAIN =======================
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -181,6 +230,11 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < N; ++i) fin >> h_x[i] >> h_y[i];
     fin.close();
 
+    hipEvent_t start, stop;
+    hipEventCreate(&start) ;
+     hipEventCreate(&stop) ;
+
+   hipEventRecord(start, 0) ;
     int K2 = K / 2;
     vector<DataType> h_dir_x, h_dir_y;
     generate_directions(K, h_dir_x, h_dir_y);
@@ -242,23 +296,113 @@ int main(int argc, char* argv[]) {
     vector<int> h_full_idx(K);
     hipMemcpy(h_full_idx.data(), d_full_idx, K*sizeof(int), hipMemcpyDeviceToHost);
 
-    // Save polygon
-    ofstream fout("polygon.txt");
-    if (!fout) { cerr << "Cannot open polygon.txt\n"; return -1; }
-    for (int i = 0; i < K; i++) {
-        int idx = h_full_idx[i];
-        fout << h_x[idx] << " " << h_y[idx] << "\n";
-    }
-    fout.close();
-    cout << "Polygon of K extreme points saved to polygon.txt\n";
-
-    // Cleanup
-    hipFree(d_x); hipFree(d_y);
+    // Free intermediate buffers
     hipFree(d_dir_x); hipFree(d_dir_y);
     hipFree(d_block_min_proj); hipFree(d_block_max_proj);
     hipFree(d_min_proj_half); hipFree(d_max_proj_half);
     hipFree(d_min_idx_half); hipFree(d_max_idx_half);
     hipFree(d_full_proj); hipFree(d_full_idx);
+
+    vector<int> unique_indices;
+    for (int i = 0; i < K; i++) {
+        if(i==0){
+            if(h_full_idx[i] != h_full_idx[K-1])
+                unique_indices.push_back(h_full_idx[i]);
+        }
+        else if(h_full_idx[i] != h_full_idx[i-1]) {
+            
+            unique_indices.push_back(h_full_idx[i]);
+        }
+    }
+    cout << "Number of unique extreme points found: " << unique_indices.size() << "\n";
+
+    K=unique_indices.size();
+    // K unique Extream points are stored in unique_indices
+    vector<DataType> h_polygon_x(K), h_polygon_y(K);
+    for (int i = 0; i < K; i++) {
+        h_polygon_x[i] = h_x[unique_indices[i]];
+        h_polygon_y[i] = h_y[unique_indices[i]];
+    }
+
+    // Allocate device memory to mark points inside the polygon
+    char *d_inside;
+    hipMalloc(&d_inside, N * sizeof(char));
+    vector<char> h_inside(N, 1);
+    hipMemcpy(d_inside, h_inside.data(), N*sizeof(char), hipMemcpyHostToDevice);
+
+    // allocate and copy polygon points to device  for further processing
+    DataType *d_polygon_x, *d_polygon_y;
+
+    hipMalloc(&d_polygon_x, K * sizeof(DataType));
+    hipMalloc(&d_polygon_y, K * sizeof(DataType));
+    hipMemcpy(d_polygon_x, h_polygon_x.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
+    hipMemcpy(d_polygon_y, h_polygon_y.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
+
+    
+
+    //now using the polygon points (d_polygon_x, d_polygon_y) for further processing
+    // kernel which checks if a point is inside the polygon or not and marks it in d_point_inside
+    
+    int blocks_per_edge = (104*2048/TILE_SIZE)/K; // tuneable
+    int edgeNumBlocks = K * blocks_per_edge;
+
+    hipLaunchKernelGGL(point_in_polygon_kernel, dim3(edgeNumBlocks), dim3(TILE_SIZE), 0, 0,
+                    d_x, d_y, N,
+                    d_polygon_x, d_polygon_y, K,
+                    blocks_per_edge,
+                    d_inside);
+
+    // Copy result back
+    hipMemcpy(h_inside.data(), d_inside, N*sizeof(char), hipMemcpyDeviceToHost);
+    int outside_count = 0;
+    
+    hipEventRecord(stop, 0) ;
+    hipEventSynchronize(stop) ;
+    float elapsedTime;
+    hipEventElapsedTime(&elapsedTime, start, stop);
+    cout << "Time for GPU computation: " << elapsedTime << " ms\n";
+    hipEventDestroy(start) ;
+    hipEventDestroy(stop) ;
+
+    // Save points outside the polygon
+    ofstream out("points_outside_polygon.txt");
+    if (!out) { cerr << "Cannot open points_outside_polygon.txt\n"; return -1; }
+    for (int i = 0; i < N; i++) {       
+        if (h_inside[i]==0) {
+            out << h_x[i] << " " << h_y[i] << "\n";
+            outside_count++;
+        }
+    }
+    out.close();
+    cout << outside_count<<": Points outside the polygon saved to points_outside_polygon.txt\n";
+
+
+
+
+
+
+
+
+
+    
+    // Save polygon
+
+
+    ofstream fout("polygon.txt");
+    if (!fout) { cerr << "Cannot open polygon.txt\n"; return -1; }
+    for (int idx : unique_indices) {
+        fout << h_x[idx] << " " << h_y[idx] << "\n";
+    }
+    fout.close();
+    cout << "Polygon of K extreme points saved to polygon.txt\n";
+
+
+    // Cleanup
+    hipFree(d_polygon_x); hipFree(d_polygon_y);
+    hipFree(d_inside);
+
+    hipFree(d_x); hipFree(d_y);
+    
 
     return 0;
 }
