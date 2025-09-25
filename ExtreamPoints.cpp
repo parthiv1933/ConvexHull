@@ -32,8 +32,6 @@ void generate_directions(int K, vector<DataType>& dir_x, vector<DataType>& dir_y
 __global__ void block_min_max_kernel(
     const DataType* __restrict__ x,
     const DataType* __restrict__ y,
-    const DataType* __restrict__ dir_x,
-    const DataType* __restrict__ dir_y,
     int N,
     int K2,
     int blocks_per_dir,
@@ -50,8 +48,14 @@ __global__ void block_min_max_kernel(
     int dBlock= globalBlock % blocks_per_dir;
     if (dir >= K2) return;
 
-    DataType dx = dir_x[dir];
-    DataType dy = dir_y[dir];
+    // DataType dx = dir_x[dir];
+    // DataType dy = dir_y[dir];
+    //calculate direction on the fly to save memory bandwidth
+    double angle = (2.0 * M_PI * dir) / (K2*2);
+    DataType dx = cos(angle);
+    DataType dy = sin(angle);
+
+    
 
     DataType local_min = FLT_MAX;
     DataType local_max = -FLT_MAX;
@@ -110,8 +114,6 @@ __global__ void global_min_max_reduce(
 __global__ void recover_indices(
     const DataType* __restrict__ x,
     const DataType* __restrict__ y,
-    const DataType* __restrict__ dir_x,
-    const DataType* __restrict__ dir_y,
     const DataType* __restrict__ min_proj_half,
     const DataType* __restrict__ max_proj_half,
     int N,
@@ -122,8 +124,13 @@ __global__ void recover_indices(
     int d = blockIdx.x * blockDim.x + threadIdx.x;
     if (d >= K2) return;
 
-    DataType dx = dir_x[d];
-    DataType dy = dir_y[d];
+    // DataType dx = dir_x[d];
+    // DataType dy = dir_y[d];
+    //calculate direction on the fly to save memory bandwidth
+    double angle = (2.0 * M_PI * d) / (K2*2);
+    DataType dx = cos(angle);
+    DataType dy = sin(angle);
+
     DataType target_min = min_proj_half[d];
     DataType target_max = max_proj_half[d];
 
@@ -236,19 +243,20 @@ int main(int argc, char* argv[]) {
 
    hipEventRecord(start, 0) ;
     int K2 = K / 2;
-    vector<DataType> h_dir_x, h_dir_y;
-    generate_directions(K, h_dir_x, h_dir_y);
+    // vector<DataType> h_dir_x, h_dir_y;
+    // generate_directions(K, h_dir_x, h_dir_y);
 
     // GPU buffers
-    DataType *d_x, *d_y, *d_dir_x, *d_dir_y;
+    DataType *d_x, *d_y;
+    //  *d_dir_x, *d_dir_y;
     hipMalloc(&d_x, N * sizeof(DataType));
     hipMalloc(&d_y, N * sizeof(DataType));
-    hipMalloc(&d_dir_x, K2 * sizeof(DataType));
-    hipMalloc(&d_dir_y, K2 * sizeof(DataType));
+    // hipMalloc(&d_dir_x, K2 * sizeof(DataType));
+    // hipMalloc(&d_dir_y, K2 * sizeof(DataType));
     hipMemcpy(d_x, h_x.data(), N*sizeof(DataType), hipMemcpyHostToDevice);
     hipMemcpy(d_y, h_y.data(), N*sizeof(DataType), hipMemcpyHostToDevice);
-    hipMemcpy(d_dir_x, h_dir_x.data(), K2*sizeof(DataType), hipMemcpyHostToDevice);
-    hipMemcpy(d_dir_y, h_dir_y.data(), K2*sizeof(DataType), hipMemcpyHostToDevice);
+    // hipMemcpy(d_dir_x, h_dir_x.data(), K2*sizeof(DataType), hipMemcpyHostToDevice);
+    // hipMemcpy(d_dir_y, h_dir_y.data(), K2*sizeof(DataType), hipMemcpyHostToDevice);
 
     // block config
     int blocks_per_dir = (104*(2048/TILE_SIZE))/K2; // tuneable
@@ -274,7 +282,7 @@ int main(int argc, char* argv[]) {
     // ===== Launch kernels =====
     size_t shared_mem_bytes = 2 * TILE_SIZE * sizeof(DataType);
     hipLaunchKernelGGL(block_min_max_kernel, dim3(numBlocks), dim3(TILE_SIZE), shared_mem_bytes, 0,
-                       d_x, d_y, d_dir_x, d_dir_y, N, K2, blocks_per_dir,
+                       d_x, d_y, N, K2, blocks_per_dir,
                        d_block_min_proj, d_block_max_proj);
 
     int threads2 = 128;
@@ -284,8 +292,7 @@ int main(int argc, char* argv[]) {
                        d_min_proj_half, d_max_proj_half);
 
     hipLaunchKernelGGL(recover_indices, dim3(blocks2), dim3(threads2), 0, 0,
-                       d_x, d_y, d_dir_x, d_dir_y,
-                       d_min_proj_half, d_max_proj_half, N, K2,
+                       d_x, d_y, d_min_proj_half, d_max_proj_half, N, K2,
                        d_min_idx_half, d_max_idx_half);
 
     hipLaunchKernelGGL(reconstruct_full_K, dim3(blocks2), dim3(threads2), 0, 0,
@@ -297,7 +304,7 @@ int main(int argc, char* argv[]) {
     hipMemcpy(h_full_idx.data(), d_full_idx, K*sizeof(int), hipMemcpyDeviceToHost);
 
     // Free intermediate buffers
-    hipFree(d_dir_x); hipFree(d_dir_y);
+    // hipFree(d_dir_x); hipFree(d_dir_y);
     hipFree(d_block_min_proj); hipFree(d_block_max_proj);
     hipFree(d_min_proj_half); hipFree(d_max_proj_half);
     hipFree(d_min_idx_half); hipFree(d_max_idx_half);
