@@ -6,6 +6,10 @@
 #include <limits>
 #include <cfloat>
 #include <chrono>
+#include <thrust/device_ptr.h>
+#include <thrust/sort.h>
+#include <thrust/gather.h>
+#include <thrust/sequence.h>
 
 typedef float DataType;
 using namespace std;
@@ -239,6 +243,267 @@ __global__ void point_in_polygon_kernel(
     }
 }
 
+// ======================= Kernel 5: Count Points outside Polygon =======================
+__global__ void points_outside_polygon(
+    const char* __restrict__ inside,
+    int N,
+    int* outside_indices,
+    int* outside_count
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    if (inside[idx] == 0) {
+        int pos = atomicAdd(outside_count, 1);
+        outside_indices[pos] = idx;
+    }
+}
+
+// ======================= Kernel 6: Get Coordinates of Points outside Polygon =======================
+__global__ void coordinates_of_points_outside_polygon(
+    const DataType* __restrict__ x,
+    const DataType* __restrict__ y,
+    const int* __restrict__ outside_indices,
+    int outside_count,
+    DataType* outside_x,
+    DataType* outside_y
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= outside_count) return;
+    int point_idx = outside_indices[idx];
+    outside_x[idx] = x[point_idx];
+    outside_y[idx] = y[point_idx];
+}
+
+// comparator for sorting indices based on x-values, then y-values if tie
+struct CompareByXY {
+    const DataType* x;
+    const DataType* y;
+    CompareByXY(const DataType* x_ptr, const DataType* y_ptr) : x(x_ptr), y(y_ptr) {}
+
+    __host__ __device__
+    bool operator()(const int& a, const int& b) const {
+        if (x[a] < x[b]) return true;
+        if (x[a] > x[b]) return false;
+        // tie-breaker on y
+        return y[a] < y[b];
+    }
+};
+
+// ======================= 2D Cross Product =======================
+__device__ inline DataType cross2d(DataType ax, DataType ay, DataType bx, DataType by) {
+    return ax * by - ay * bx;
+}
+
+// small epsilon for robust orientation tests
+__device__ static inline float ORIENT_EPS() { return 1e-6f; }
+
+// monotone chain that reads source px/py (length n) and writes hull into hx/hy.
+// Returns hull size (m). src arrays are NOT modified.
+__device__ int monotone_chain_full_src_to_dst(const DataType* __restrict__ srcx,
+                                              const DataType* __restrict__ srcy,
+                                              int n,
+                                              DataType* __restrict__ hx,
+                                              DataType* __restrict__ hy)
+{
+    if (n <= 1) {
+        if (n == 1) { hx[0] = srcx[0]; hy[0] = srcy[0]; }
+        return n;
+    }
+
+    int k = 0;
+    float eps = ORIENT_EPS();
+
+    // lower hull
+    for (int i = 0; i < n; ++i) {
+        DataType xi = srcx[i], yi = srcy[i];
+        while (k >= 2) {
+            DataType x1 = hx[k-2], y1 = hy[k-2];
+            DataType x2 = hx[k-1], y2 = hy[k-1];
+            DataType cr = (x2 - x1)*(yi - y1) - (y2 - y1)*(xi - x1);
+            if (cr <= eps) --k; else break;
+        }
+        hx[k] = xi; hy[k] = yi; ++k;
+    }
+
+    // upper hull
+    int t = k;
+    for (int i = n - 2; i >= 0; --i) {
+        DataType xi = srcx[i], yi = srcy[i];
+        while (k >= t + 1) {
+            DataType x1 = hx[k-2], y1 = hy[k-2];
+            DataType x2 = hx[k-1], y2 = hy[k-1];
+            DataType cr = (x2 - x1)*(yi - y1) - (y2 - y1)*(xi - x1);
+            if (cr <= eps) --k; else break;
+        }
+        hx[k] = xi; hy[k] = yi; ++k;
+    }
+
+    if (k > 1) --k; // remove duplicated first
+    return k;
+}
+
+
+
+// ======================= Kernel 7: Build Local Hulls (not used in main) =======================
+#define GROUP_SIZE 256
+// BUILD_THREADS should be <= GROUP_SIZE (you set GROUP_SIZE=256)
+__global__ void build_local_hulls(const DataType* __restrict__ d_x,
+                                  const DataType* __restrict__ d_y,
+                                  int N,
+                                  DataType* __restrict__ per_hull_x, // size groups*GROUP_SIZE (slot)
+                                  DataType* __restrict__ per_hull_y,
+                                  int* __restrict__ per_hull_size)
+{
+    int group_id = blockIdx.x;
+    int start = group_id * GROUP_SIZE;
+    if (start >= N) return;
+    int end = start + GROUP_SIZE;
+    if (end > N) end = N;
+    int count = end - start;
+
+    int tid = threadIdx.x;
+
+    // allocate shared memory: srcx/srcy and hx/hy each length GROUP_SIZE
+    extern __shared__ DataType s_mem[]; // size must be 4 * GROUP_SIZE * sizeof(DataType) when launching
+    DataType* srcx = s_mem;                        // GROUP_SIZE
+    DataType* srcy = &s_mem[GROUP_SIZE];           // GROUP_SIZE
+    DataType* hx   = &s_mem[2*GROUP_SIZE];         // GROUP_SIZE
+    DataType* hy   = &s_mem[3*GROUP_SIZE];         // GROUP_SIZE
+
+    // cooperative copy input -> shared src
+    for (int i = tid; i < count; i += blockDim.x) {
+        srcx[i] = d_x[start + i];
+        srcy[i] = d_y[start + i];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        if (count <= 1) {
+            per_hull_size[group_id] = count;
+            if (count == 1) {
+                // write single point into per_hull slot
+                per_hull_x[(size_t)group_id * GROUP_SIZE + 0] = srcx[0];
+                per_hull_y[(size_t)group_id * GROUP_SIZE + 0] = srcy[0];
+            }
+        } else {
+            int hull_sz = monotone_chain_full_src_to_dst(srcx, srcy, count, hx, hy);
+            per_hull_size[group_id] = hull_sz;
+            // write hull (compact) into global per_hull slot
+            size_t base = (size_t)group_id * GROUP_SIZE;
+            for (int i = 0; i < hull_sz; ++i) {
+                per_hull_x[base + i] = hx[i];
+                per_hull_y[base + i] = hy[i];
+            }
+            // optional: leave remainder of slot untouched
+        }
+    }
+}
+
+
+// ======================= Kernel 8: Merge Hull Pairs  =======================
+#define SHARED_LIMIT 2048  // max points we will stage in shared memory (tuneable)
+#define BUILD_THREADS 256   // threads for building local hulls per block (<= GROUP_SIZE)
+#define MERGE_THREADS 256    // threads for merge blocks
+//
+__global__ void merge_pairs_kernel_opt(const DataType* __restrict__ in_x,
+                                       const DataType* __restrict__ in_y,
+                                       const int* __restrict__ in_offsets,
+                                       const int* __restrict__ in_sizes,
+                                       int num_in_hulls,
+                                       DataType* __restrict__ out_buf_x,
+                                       DataType* __restrict__ out_buf_y,
+                                       int* __restrict__ out_offsets,
+                                       int* __restrict__ out_sizes,
+                                       int* __restrict__ d_out_alloc_ptr)
+{
+    int pair_id = blockIdx.x;
+    int left_idx = pair_id * 2;
+    int right_idx = left_idx + 1;
+    if (left_idx >= num_in_hulls) return;
+
+    int left_off = in_offsets[left_idx];
+    int left_sz  = in_sizes[left_idx];
+
+    int right_off = 0;
+    int right_sz = 0;
+    if (right_idx < num_in_hulls) {
+        right_off = in_offsets[right_idx];
+        right_sz  = in_sizes[right_idx];
+    }
+
+    int total = left_sz + right_sz;
+    if (total == 0) {
+        out_offsets[pair_id] = 0;
+        out_sizes[pair_id] = 0;
+        return;
+    }
+
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+
+    // Fast path: if total <= SHARED_LIMIT, stage concat into shared memory and process there
+    if (total <= SHARED_LIMIT) {
+    extern __shared__ DataType shared_arr[]; // size at host launch: 4*SHARED_LIMIT*sizeof(DataType)
+    DataType* s_srcx = shared_arr;                        // total
+    DataType* s_srcy = &shared_arr[SHARED_LIMIT];         // total
+    DataType* s_hx   = &shared_arr[2*SHARED_LIMIT];       // total
+    DataType* s_hy   = &shared_arr[3*SHARED_LIMIT];       // total
+
+    // copy left
+    for (int i = tid; i < left_sz; i += bdim) {
+        s_srcx[i] = in_x[left_off + i];
+        s_srcy[i] = in_y[left_off + i];
+    }
+    // copy right
+    for (int i = tid; i < right_sz; i += bdim) {
+        s_srcx[left_sz + i] = in_x[right_off + i];
+        s_srcy[left_sz + i] = in_y[right_off + i];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        // build hull from src -> hx
+        int k = monotone_chain_full_src_to_dst(s_srcx, s_srcy, total, s_hx, s_hy);
+
+        // reserve global region and copy hull out
+        int out_base = atomicAdd(d_out_alloc_ptr, k);
+        for (int i = 0; i < k; ++i) {
+            out_buf_x[out_base + i] = s_hx[i];
+            out_buf_y[out_base + i] = s_hy[i];
+        }
+        out_offsets[pair_id] = out_base;
+        out_sizes[pair_id] = k;
+    }
+    return;
+}
+    // Slow path: total > SHARED_LIMIT -> write concatenation to global out buffer then run monotone chain in-place there
+    // Reserve region in out buffer for 'total' entries
+    int out_base_total = atomicAdd(d_out_alloc_ptr, total);
+
+    // cooperative copy concatenated sequence into reserved out region
+    for (int i = tid; i < left_sz; i += bdim) {
+        out_buf_x[out_base_total + i] = in_x[left_off + i];
+        out_buf_y[out_base_total + i] = in_y[left_off + i];
+    }
+    for (int i = tid; i < right_sz; i += bdim) {
+        out_buf_x[out_base_total + left_sz + i] = in_x[right_off + i];
+        out_buf_y[out_base_total + left_sz + i] = in_y[right_off + i];
+    }
+    __syncthreads();
+
+    // leader computes monotone chain in-place in global memory (on out_buf arrays)
+    if (tid == 0) {
+    DataType* srcx = &out_buf_x[out_base_total];
+    DataType* srcy = &out_buf_y[out_base_total];
+    DataType* hx = &out_buf_x[out_base_total]; // destination can be same region start
+    DataType* hy = &out_buf_y[out_base_total];
+
+    int k = monotone_chain_full_src_to_dst(srcx, srcy, total, hx, hy);
+    out_offsets[pair_id] = out_base_total;
+    out_sizes[pair_id] = k;
+}
+}
+
 
 // ======================= MAIN =======================
 int main(int argc, char* argv[]) {
@@ -256,6 +521,9 @@ int main(int argc, char* argv[]) {
 
     int N, K;
     fin >> N >> K;
+    // // fin >>N;
+    // N=20000000;
+    // K=256;
     vector<DataType> h_x(N), h_y(N);
     for (int i = 0; i < N; ++i) fin >> h_x[i] >> h_y[i];
     fin.close();
@@ -282,7 +550,7 @@ int main(int argc, char* argv[]) {
     // hipMemcpy(d_dir_y, h_dir_y.data(), K2*sizeof(DataType), hipMemcpyHostToDevice);
 
     // block config
-    int blocks_per_dir = (104*(2048/TILE_SIZE))/K2; // tuneable
+    int blocks_per_dir = (104*(2048/TILE_SIZE))/K2; // tuneable here 104 is #of Cus and 2048 is max threads per Cu
     cout<< "block_per_direction: "<<blocks_per_dir<<endl;
     int numBlocks = K2 * blocks_per_dir;
 
@@ -332,7 +600,8 @@ int main(int argc, char* argv[]) {
     hipFree(d_min_proj_half); hipFree(d_max_proj_half);
     hipFree(d_min_idx_half); hipFree(d_max_idx_half);
     hipFree(d_full_proj); hipFree(d_full_idx);
-
+    
+    // !!! remove duplicate extream points to be done on gpu !!!
     vector<int> unique_indices;
     for (int i = 0; i < K; i++) {
         if(i==0){
@@ -382,9 +651,186 @@ int main(int argc, char* argv[]) {
                     blocks_per_edge,
                     d_inside);
 
+
+    
     // Copy result back
-    hipMemcpy(h_inside.data(), d_inside, N*sizeof(char), hipMemcpyDeviceToHost);
-    int outside_count = 0;
+    // hipMemcpy(h_inside.data(), d_inside, N*sizeof(char), hipMemcpyDeviceToHost);
+    // int outside_count = 0;
+    
+    //now find outside points on gpu
+    int *id_inside;
+    hipMalloc(&id_inside, N * sizeof(int));
+    int *outside_count;
+    hipMalloc(&outside_count, sizeof(int));
+    hipMemset(outside_count, 0, sizeof(int));
+
+    hipLaunchKernelGGL( points_outside_polygon, dim3((N+TILE_SIZE-1)/TILE_SIZE), dim3(TILE_SIZE), 0, 0,
+                        d_inside, N, id_inside, outside_count);
+
+    int h_outside_count;
+    hipMemcpy(&h_outside_count, outside_count, sizeof(int), hipMemcpyDeviceToHost);
+    cout << h_outside_count << ": Points outside the polygon\n";
+    hipFree(d_polygon_x); hipFree(d_polygon_y);
+    hipFree(d_inside);
+
+    // Get coordinates of points outside the polygon
+    DataType *d_point_outside_x, *d_point_outside_y;
+    hipMalloc(&d_point_outside_x, h_outside_count * sizeof(DataType));
+    hipMalloc(&d_point_outside_y, h_outside_count * sizeof(DataType));
+    hipLaunchKernelGGL(coordinates_of_points_outside_polygon, dim3((h_outside_count+TILE_SIZE-1)/TILE_SIZE), dim3(TILE_SIZE), 0, 0,
+                        d_x, d_y, id_inside, h_outside_count,
+                        d_point_outside_x, d_point_outside_y);
+
+
+    //now thrust based sorting of points outside the polygon based on x and then y coordinates
+     // Allocate index array
+    int* d_indices;
+    hipMalloc(&d_indices, h_outside_count * sizeof(int));
+
+    // Wrap in thrust::device_ptr
+    thrust::device_ptr<int> t_indices(d_indices);
+    thrust::sequence(t_indices, t_indices + h_outside_count);
+    
+    // Sort by x and then by y
+    thrust::sort(t_indices, t_indices + h_outside_count, CompareByXY(d_point_outside_x, d_point_outside_y));
+
+    // Allocate sorted outputs
+    DataType* d_x_sorted;
+    DataType* d_y_sorted;
+    hipMalloc(&d_x_sorted, h_outside_count * sizeof(DataType));
+    hipMalloc(&d_y_sorted, h_outside_count * sizeof(DataType));
+
+    // Gather sorted points
+    thrust::device_ptr<DataType> t_point_outside_x(d_point_outside_x);
+    thrust::device_ptr<DataType> t_point_outside_y(d_point_outside_y);
+    thrust::device_ptr<DataType> t_x_sorted(d_x_sorted);
+    thrust::device_ptr<DataType> t_y_sorted(d_y_sorted);
+    thrust::gather(t_indices, t_indices + h_outside_count, t_point_outside_x, t_x_sorted);
+    thrust::gather(t_indices, t_indices + h_outside_count, t_point_outside_y, t_y_sorted);
+
+    // Copy sorted results back to host
+    // vector<DataType> h_x_outside_sorted(h_outside_count);
+    // vector<DataType> h_y_outside_sorted(h_outside_count);
+    // hipMemcpy(h_x_outside_sorted.data(), d_x_sorted, h_outside_count * sizeof(DataType), hipMemcpyDeviceToHost);
+    // hipMemcpy(h_y_outside_sorted.data(), d_y_sorted, h_outside_count * sizeof(DataType), hipMemcpyDeviceToHost);
+       hipFree(d_x); hipFree(d_y);
+    int group_size = GROUP_SIZE;
+    int num_groups = (h_outside_count + group_size - 1) / group_size;
+    cout << "GROUP_SIZE=" << GROUP_SIZE << ", num_groups=" << num_groups << "\n";
+    
+    DataType *d_per_hull_x = nullptr, *d_per_hull_y = nullptr;
+    int *d_per_hull_size = nullptr;
+    hipMalloc(&d_per_hull_x, (size_t)num_groups * (size_t)group_size * sizeof(DataType)); 
+    hipMalloc(&d_per_hull_y, (size_t)num_groups * (size_t)group_size * sizeof(DataType));
+    hipMalloc(&d_per_hull_size, (size_t)num_groups * sizeof(int));
+
+        dim3 blocks_build((size_t)num_groups);
+        dim3 threads_build((size_t)std::min(BUILD_THREADS, group_size));
+        cout << "Launching build_local_hulls: blocks=" << blocks_build.x << " threads=" << threads_build.x << "\n";
+
+        size_t shared_bytes = 4 * GROUP_SIZE * sizeof(DataType);
+        hipLaunchKernelGGL(build_local_hulls, blocks_build, threads_build, shared_bytes, 0,
+                           d_x_sorted, d_y_sorted, h_outside_count,
+                           d_per_hull_x, d_per_hull_y, d_per_hull_size);
+        hipDeviceSynchronize();
+
+
+     // initial in offsets for level 0: each group's slot begins at g*GROUP_SIZE
+    int *d_in_offsets = nullptr;
+    int *d_in_sizes = nullptr;
+    hipMalloc(&d_in_offsets, (size_t)num_groups * sizeof(int)) ;
+    hipMalloc(&d_in_sizes, (size_t)num_groups * sizeof(int)) ;
+
+    // prepare offsets on host and copy
+    std::vector<int> h_in_offsets(num_groups);
+    for (int g = 0; g < num_groups; ++g) h_in_offsets[g] = g * group_size;
+    hipMemcpy(d_in_offsets, h_in_offsets.data(), (size_t)num_groups * sizeof(int), hipMemcpyHostToDevice) ;
+
+    // copy sizes (device->device)
+    hipMemcpy(d_in_sizes, d_per_hull_size, (size_t)num_groups * sizeof(int), hipMemcpyDeviceToDevice) ;
+
+    // allocate a big buffer for merged hull vertices (size N)
+    DataType *d_buf_x = nullptr, *d_buf_y = nullptr;
+    hipMalloc(&d_buf_x, (size_t)h_outside_count * sizeof(DataType)) ;
+    hipMalloc(&d_buf_y, (size_t)h_outside_count * sizeof(DataType)) ;
+
+
+    // prepare out offsets/sizes buffers (max needed initially ceil(num_groups/2))
+    int max_hulls = num_groups;
+    int max_pairs = (max_hulls + 1) / 2;
+    int *d_out_offsets = nullptr, *d_out_sizes = nullptr;
+    hipMalloc(&d_out_offsets, (size_t)max_pairs * sizeof(int));
+    hipMalloc(&d_out_sizes, (size_t)max_pairs * sizeof(int));
+
+    // allocate allocator counter
+    int *d_out_alloc_ptr = nullptr;
+    hipMalloc(&d_out_alloc_ptr, sizeof(int));
+
+    // set "in" pointers to level-0 storage
+    DataType* in_x = d_per_hull_x;
+    DataType* in_y = d_per_hull_y;
+    int* in_offsets = d_in_offsets;
+    int* in_sizes = d_in_sizes;
+    int in_num_hulls = num_groups;
+
+    int round = 0;
+     while (in_num_hulls > 1) {
+        int num_pairs = (in_num_hulls + 1) / 2;
+        // reset allocator to 0
+        hipMemset(d_out_alloc_ptr, 0, sizeof(int));
+
+        // ensure out_offsets/out_sizes have enough space for num_pairs (reallocate if needed)
+        hipFree(d_out_offsets);
+        hipFree(d_out_sizes);
+        hipMalloc(&d_out_offsets, (size_t)num_pairs * sizeof(int));
+        hipMalloc(&d_out_sizes, (size_t)num_pairs * sizeof(int));
+
+        std::cout << "Round " << round << ": in_num_hulls=" << in_num_hulls << " -> num_pairs=" << num_pairs << "\n";
+
+        
+       
+        size_t shared_mem_bytes = 4 * SHARED_LIMIT * sizeof(DataType); // srcx,srcy,hx,hy
+
+        // Launch (one block per pair)
+        hipLaunchKernelGGL(merge_pairs_kernel_opt, dim3(num_pairs), dim3(MERGE_THREADS),
+                        shared_mem_bytes, 0,
+                        in_x, in_y, in_offsets, in_sizes, in_num_hulls,
+                        d_buf_x, d_buf_y, d_out_offsets, d_out_sizes, d_out_alloc_ptr);
+ 
+        hipDeviceSynchronize();
+
+        // after merge: the merged hulls are contiguous in d_buf_x/d_buf_y at offsets given in d_out_offsets,
+        // and their sizes are in d_out_sizes. The allocator value contains total points used (could read if needed).
+
+        // prepare next round
+        // swap: in_* := out_* ; reuse buffers
+        in_x = d_buf_x;
+        in_y = d_buf_y;
+        in_offsets = d_out_offsets;
+        in_sizes = d_out_sizes;
+        in_num_hulls = num_pairs;
+
+        // allocate fresh buffers for the next iteration's out (we will do that at loop top)
+        round++;
+    }
+
+    int h_final_size = 0;
+    int h_final_offset = 0;
+    hipMemcpy(&h_final_size, in_sizes, sizeof(int), hipMemcpyDeviceToHost) ;
+    hipMemcpy(&h_final_offset, in_offsets, sizeof(int), hipMemcpyDeviceToHost);
+    std::vector<DataType> h_hull_x(h_final_size), h_hull_y(h_final_size);
+    if (h_final_size > 0) {
+        hipMemcpy(h_hull_x.data(), &in_x[h_final_offset], (size_t)h_final_size * sizeof(DataType), hipMemcpyDeviceToHost);
+        hipMemcpy(h_hull_y.data(), &in_y[h_final_offset], (size_t)h_final_size * sizeof(DataType), hipMemcpyDeviceToHost);
+    }
+
+    
+    hipFree(outside_count);
+    hipFree(id_inside);
+    
+    
+ 
+    
     
     hipEventRecord(stop, 0) ;
     hipEventSynchronize(stop) ;
@@ -394,17 +840,38 @@ int main(int argc, char* argv[]) {
     hipEventDestroy(start) ;
     hipEventDestroy(stop) ;
 
-    // Save points outside the polygon
-    ofstream out("points_outside_polygon.txt");
-    if (!out) { cerr << "Cannot open points_outside_polygon.txt\n"; return -1; }
-    for (int i = 0; i < N; i++) {       
-        if (h_inside[i]==0) {
-            out << h_x[i] << " " << h_y[i] << "\n";
-            outside_count++;
-        }
+    // write to file
+    std::ofstream fout("polygon_final.txt");
+    if (!fout) std::cerr << "Cannot open polygon_final.txt\n";
+    else {
+        // fout << h_final_size << "\n";
+        for (int i = 0; i < h_final_size; ++i) fout << h_hull_x[i] << " " << h_hull_y[i] << "\n";
+        fout.close();
+        std::cout << "Wrote polygon_final.txt\n";
     }
-    out.close();
-    cout << outside_count<<": Points outside the polygon saved to points_outside_polygon.txt\n";
+   
+
+
+
+    // //print all sorted points outside the polygon
+    // ofstream out("points_outside_polygon.txt");
+    // if (!out) { cerr << "Cannot open points_outside_polygon.txt\n"; return -1; }
+    // for (int i = 0; i < h_outside_count; i++) {       
+    //         out << h_x_outside_sorted[i] << " " << h_y_outside_sorted[i] << "\n";
+    // }
+    // out.close();
+    // cout << h_outside_count<<": Points outside the polygon saved to points_outside_polygon.txt\n";
+    // Save points outside the polygon
+    // ofstream out("points_outside_polygon.txt");
+    // if (!out) { cerr << "Cannot open points_outside_polygon.txt\n"; return -1; }
+    // for (int i = 0; i < N; i++) {       
+    //     if (h_inside[i]==0) {
+    //         out << h_x[i] << " " << h_y[i] << "\n";
+    //         outside_count++;
+    //     }
+    // }
+    // out.close();
+    // cout << outside_count<<": Points outside the polygon saved to points_outside_polygon.txt\n";
 
 
 
@@ -418,20 +885,27 @@ int main(int argc, char* argv[]) {
     // Save polygon
 
 
-    ofstream fout("polygon.txt");
-    if (!fout) { cerr << "Cannot open polygon.txt\n"; return -1; }
+    ofstream xout("polygon.txt");
+    if (!xout) { cerr << "Cannot open polygon.txt\n"; return -1; }
     for (int idx : unique_indices) {
-        fout << h_x[idx] << " " << h_y[idx] << "\n";
+        xout << h_x[idx] << " " << h_y[idx] << "\n";
     }
-    fout.close();
-    cout << "Polygon of K extreme points saved to polygon.txt\n";
+    xout.close();
+    cout << "Polygon of" << K <<" uniuque extreme points saved to polygon.txt\n";
 
 
-    // Cleanup
-    hipFree(d_polygon_x); hipFree(d_polygon_y);
-    hipFree(d_inside);
+    // Clean up
+    hipFree(d_point_outside_x); hipFree(d_point_outside_y);
+    hipFree(d_indices);
+    hipFree(d_x_sorted); hipFree(d_y_sorted);
+    hipFree(d_per_hull_x); hipFree(d_per_hull_y); hipFree(d_per_hull_size);
+    hipFree(d_in_offsets); hipFree(d_in_sizes);
+    hipFree(d_buf_x); hipFree(d_buf_y);
+    hipFree(d_out_offsets); hipFree(d_out_sizes);
+    hipFree(d_out_alloc_ptr);
 
-    hipFree(d_x); hipFree(d_y);
+
+    
     
 
     return 0;
