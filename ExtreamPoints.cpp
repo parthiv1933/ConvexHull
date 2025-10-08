@@ -345,8 +345,8 @@ __device__ int monotone_chain_full_src_to_dst(const DataType* __restrict__ srcx,
 
 
 // ======================= Kernel 7: Build Local Hulls (not used in main) =======================
-#define GROUP_SIZE 256
-// BUILD_THREADS should be <= GROUP_SIZE (you set GROUP_SIZE=256)
+#define GROUP_SIZE 1024
+
 __global__ void build_local_hulls(const DataType* __restrict__ d_x,
                                   const DataType* __restrict__ d_y,
                                   int N,
@@ -370,7 +370,7 @@ __global__ void build_local_hulls(const DataType* __restrict__ d_x,
     DataType* hx   = &s_mem[2*GROUP_SIZE];         // GROUP_SIZE
     DataType* hy   = &s_mem[3*GROUP_SIZE];         // GROUP_SIZE
 
-    // cooperative copy input -> shared src
+    
     for (int i = tid; i < count; i += blockDim.x) {
         srcx[i] = d_x[start + i];
         srcy[i] = d_y[start + i];
@@ -394,7 +394,7 @@ __global__ void build_local_hulls(const DataType* __restrict__ d_x,
                 per_hull_x[base + i] = hx[i];
                 per_hull_y[base + i] = hy[i];
             }
-            // optional: leave remainder of slot untouched
+           
         }
     }
 }
@@ -402,8 +402,8 @@ __global__ void build_local_hulls(const DataType* __restrict__ d_x,
 
 // ======================= Kernel 8: Merge Hull Pairs  =======================
 #define SHARED_LIMIT 2048  // max points we will stage in shared memory (tuneable)
-#define BUILD_THREADS 256   // threads for building local hulls per block (<= GROUP_SIZE)
-#define MERGE_THREADS 256    // threads for merge blocks
+#define BUILD_THREADS  1024// threads for building local hulls per block (<= GROUP_SIZE)
+#define MERGE_THREADS  1024    // threads for merge blocks
 //
 __global__ void merge_pairs_kernel_opt(const DataType* __restrict__ in_x,
                                        const DataType* __restrict__ in_y,
@@ -476,7 +476,7 @@ __global__ void merge_pairs_kernel_opt(const DataType* __restrict__ in_x,
     }
     return;
 }
-    // Slow path: total > SHARED_LIMIT -> write concatenation to global out buffer then run monotone chain in-place there
+    // Slow path: total > SHARED_LIMIT -> write concatenation to global out buffer then run monotone chain  there
     // Reserve region in out buffer for 'total' entries
     int out_base_total = atomicAdd(d_out_alloc_ptr, total);
 
@@ -507,7 +507,7 @@ __global__ void merge_pairs_kernel_opt(const DataType* __restrict__ in_x,
 
 // ======================= MAIN =======================
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    if (argc < 4) {
         cerr << "Usage: " << argv[0] << " <input_file>\n";
         return -1;
     }
@@ -519,11 +519,13 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    int N, K;
-    fin >> N >> K;
+    int N=stoi(argv[2]);
+    int K=stoi(argv[3]);
+
+    // fin >> N >> K;
     // // fin >>N;
-    // N=20000000;
-    // K=256;
+    // N=100000000;
+    // K=128;
     vector<DataType> h_x(N), h_y(N);
     for (int i = 0; i < N; ++i) fin >> h_x[i] >> h_y[i];
     fin.close();
@@ -779,7 +781,7 @@ int main(int argc, char* argv[]) {
         // reset allocator to 0
         hipMemset(d_out_alloc_ptr, 0, sizeof(int));
 
-        // ensure out_offsets/out_sizes have enough space for num_pairs (reallocate if needed)
+        // ensure out_offsets/out_sizes have enough space for num_pairs
         hipFree(d_out_offsets);
         hipFree(d_out_sizes);
         hipMalloc(&d_out_offsets, (size_t)num_pairs * sizeof(int));
@@ -800,7 +802,7 @@ int main(int argc, char* argv[]) {
         hipDeviceSynchronize();
 
         // after merge: the merged hulls are contiguous in d_buf_x/d_buf_y at offsets given in d_out_offsets,
-        // and their sizes are in d_out_sizes. The allocator value contains total points used (could read if needed).
+        // and their sizes are in d_out_sizes. The allocator value contains total points used.
 
         // prepare next round
         // swap: in_* := out_* ; reuse buffers
@@ -810,7 +812,7 @@ int main(int argc, char* argv[]) {
         in_sizes = d_out_sizes;
         in_num_hulls = num_pairs;
 
-        // allocate fresh buffers for the next iteration's out (we will do that at loop top)
+        // allocate fresh buffers for the next iteration's out 
         round++;
     }
 
@@ -818,6 +820,7 @@ int main(int argc, char* argv[]) {
     int h_final_offset = 0;
     hipMemcpy(&h_final_size, in_sizes, sizeof(int), hipMemcpyDeviceToHost) ;
     hipMemcpy(&h_final_offset, in_offsets, sizeof(int), hipMemcpyDeviceToHost);
+    cout << "Final hull size: " << h_final_size << "\n";
     std::vector<DataType> h_hull_x(h_final_size), h_hull_y(h_final_size);
     if (h_final_size > 0) {
         hipMemcpy(h_hull_x.data(), &in_x[h_final_offset], (size_t)h_final_size * sizeof(DataType), hipMemcpyDeviceToHost);
