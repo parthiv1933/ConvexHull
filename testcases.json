@@ -1,0 +1,88 @@
+{
+  "Testcases": [
+    {
+      "name": "Uniform",
+      "args": [1000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [2000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [5000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [10000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [20000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [50000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Uniform",
+      "args": [100000000, "uniform", -3000, 3000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [1000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [2000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [5000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [10000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [20000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [50000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Gaussian",
+      "args": [100000000, "gaussian", 0, 1000]
+    },
+    {
+      "name": "Circle",
+      "args": [1000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [2000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [5000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [10000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [20000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [50000000, "circle", 3000]
+    },
+    {
+      "name": "Circle",
+      "args": [100000000, "circle", 3000]
+    }
+  ]
+}
