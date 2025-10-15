@@ -505,6 +505,39 @@ __global__ void merge_pairs_kernel_opt(const DataType* __restrict__ in_x,
 }
 
 
+__global__ void remove_duplicate_extremes(const int *full_idx, int *unique_idx, int *newK, int K) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int count = 0;
+        for (int i = 0; i < K; i++) {
+            if (i == 0) {
+                if (full_idx[i] != full_idx[K - 1])
+                    unique_idx[count++] = full_idx[i];
+            } else if (full_idx[i] != full_idx[i - 1]) {
+                unique_idx[count++] = full_idx[i];
+            }
+        }
+        *newK = count;
+    }
+}
+
+__global__ void gather_polygon_points(const DataType *d_x, 
+                                      const DataType *d_y,
+                                      const int *unique_idx,
+                                      DataType *d_polygon_x, 
+                                      DataType *d_polygon_y,
+                                      int K)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < K) {
+        int idx = unique_idx[tid];
+        d_polygon_x[tid] = d_x[idx];
+        d_polygon_y[tid] = d_y[idx];
+    }
+}
+
+
+
+
 // ======================= MAIN =======================
 int main(int argc, char* argv[]) {
     if (argc < 4) {
@@ -592,9 +625,30 @@ int main(int argc, char* argv[]) {
                        d_min_proj_half, d_max_proj_half, d_min_idx_half, d_max_idx_half, K2,
                        d_full_proj, d_full_idx);
 
-    // Copy back
-    vector<int> h_full_idx(K);
-    hipMemcpy(h_full_idx.data(), d_full_idx, K*sizeof(int), hipMemcpyDeviceToHost);
+
+
+    int *d_unique_idx, *d_newK;
+    hipMalloc(&d_unique_idx, K * sizeof(int));
+    hipMalloc(&d_newK, sizeof(int));
+
+    // launch single-thread kernel
+    remove_duplicate_extremes<<<1, 1>>>(d_full_idx, d_unique_idx, d_newK, K);
+
+    hipMemcpy(&K, d_newK, sizeof(int), hipMemcpyDeviceToHost);
+
+    cout << "Number of unique extreme points found: " << K << "\n";
+    DataType *d_polygon_x, *d_polygon_y;
+
+    // then allocate polygon arrays using newK
+    hipMalloc(&d_polygon_x, K * sizeof(DataType));
+    hipMalloc(&d_polygon_y, K * sizeof(DataType));
+
+    // gather coordinates on GPU (fully device-side)
+    gather_polygon_points<<<(K + 255)/256, 256>>>(d_x, d_y, d_unique_idx, d_polygon_x, d_polygon_y, K);
+
+    // // Copy back
+    // vector<int> h_full_idx(K);
+    // hipMemcpy(h_full_idx.data(), d_full_idx, K*sizeof(int), hipMemcpyDeviceToHost);
 
     // Free intermediate buffers
     // hipFree(d_dir_x); hipFree(d_dir_y);
@@ -603,27 +657,26 @@ int main(int argc, char* argv[]) {
     hipFree(d_min_idx_half); hipFree(d_max_idx_half);
     hipFree(d_full_proj); hipFree(d_full_idx);
     
-    // !!! remove duplicate extream points to be done on gpu !!!
-    vector<int> unique_indices;
-    for (int i = 0; i < K; i++) {
-        if(i==0){
-            if(h_full_idx[i] != h_full_idx[K-1])
-                unique_indices.push_back(h_full_idx[i]);
-        }
-        else if(h_full_idx[i] != h_full_idx[i-1]) {
+    // // !!! remove duplicate extream points to be done on gpu !!!
+    // vector<int> unique_indices;
+    // for (int i = 0; i < K; i++) {
+    //     if(i==0){
+    //         if(h_full_idx[i] != h_full_idx[K-1])
+    //             unique_indices.push_back(h_full_idx[i]);
+    //     }
+    //     else if(h_full_idx[i] != h_full_idx[i-1]) {
             
-            unique_indices.push_back(h_full_idx[i]);
-        }
-    }
-    cout << "Number of unique extreme points found: " << unique_indices.size() << "\n";
+    //         unique_indices.push_back(h_full_idx[i]);
+    //     }
+    // }
 
-    K=unique_indices.size();
-    // K unique Extream points are stored in unique_indices
-    vector<DataType> h_polygon_x(K), h_polygon_y(K);
-    for (int i = 0; i < K; i++) {
-        h_polygon_x[i] = h_x[unique_indices[i]];
-        h_polygon_y[i] = h_y[unique_indices[i]];
-    }
+    // K=unique_indices.size();
+    // // K unique Extream points are stored in unique_indices
+    // vector<DataType> h_polygon_x(K), h_polygon_y(K);
+    // for (int i = 0; i < K; i++) {
+    //     h_polygon_x[i] = h_x[unique_indices[i]];
+    //     h_polygon_y[i] = h_y[unique_indices[i]];
+    // }
 
     // Allocate device memory to mark points inside the polygon
     char *d_inside;
@@ -632,12 +685,12 @@ int main(int argc, char* argv[]) {
     hipMemcpy(d_inside, h_inside.data(), N*sizeof(char), hipMemcpyHostToDevice);
 
     // allocate and copy polygon points to device  for further processing
-    DataType *d_polygon_x, *d_polygon_y;
+    // DataType *d_polygon_x, *d_polygon_y;
 
-    hipMalloc(&d_polygon_x, K * sizeof(DataType));
-    hipMalloc(&d_polygon_y, K * sizeof(DataType));
-    hipMemcpy(d_polygon_x, h_polygon_x.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
-    hipMemcpy(d_polygon_y, h_polygon_y.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
+    // hipMalloc(&d_polygon_x, K * sizeof(DataType));
+    // hipMalloc(&d_polygon_y, K * sizeof(DataType));
+    // hipMemcpy(d_polygon_x, h_polygon_x.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
+    // hipMemcpy(d_polygon_y, h_polygon_y.data(), K*sizeof(DataType), hipMemcpyHostToDevice);
 
     
 
@@ -844,7 +897,19 @@ int main(int argc, char* argv[]) {
     hipEventDestroy(stop) ;
 
     // write to file
-    std::ofstream fout("polygon_final.txt");
+    // Extract base filename from full path
+    std::string base_name =  argv[1];
+    size_t slash_pos = base_name.find_last_of("/\\");
+    if (slash_pos != std::string::npos) base_name = base_name.substr(slash_pos + 1);
+
+    // Replace ".txt" with "_polygon_<K>.txt"
+    std::string X = argv[3];
+    size_t pos = base_name.rfind(".txt");
+    if (pos != std::string::npos) base_name.replace(pos, 4, "_polygon_" + X + ".txt");
+    else base_name += "_polygon_" + X + ".txt";
+
+    // Prepend "hulls/" folder
+    std::ofstream fout("Hulls/" + base_name);
     if (!fout) std::cerr << "Cannot open polygon_final.txt\n";
     else {
         // fout << h_final_size << "\n";
@@ -888,14 +953,18 @@ int main(int argc, char* argv[]) {
     // Save polygon
 
 
-    ofstream xout("polygon.txt");
-    if (!xout) { cerr << "Cannot open polygon.txt\n"; return -1; }
-    for (int idx : unique_indices) {
-        xout << h_x[idx] << " " << h_y[idx] << "\n";
-    }
-    xout.close();
-    cout << "Polygon of" << K <<" uniuque extreme points saved to polygon.txt\n";
+    // ofstream xout("polygon.txt");
+    // if (!xout) { cerr << "Cannot open polygon.txt\n"; return -1; }
+    // for (int idx : unique_indices) {
+    //     xout << h_x[idx] << " " << h_y[idx] << "\n";
+    // }
+    // xout.close();
+    // cout << "Polygon of" << K <<" uniuque extreme points saved to polygon.txt\n";
 
+
+    cout << "Number of input points: " << N<< endl;
+    cout << "Hull vertex count: " << h_final_size << endl;
+    cout << "Parallel convex hull time: " << elapsedTime << " ms" << endl;
 
     // Clean up
     hipFree(d_point_outside_x); hipFree(d_point_outside_y);
